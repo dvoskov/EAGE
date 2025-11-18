@@ -1,15 +1,14 @@
-# Section of the Python code where we import all dependencies on third party Python modules/libaries or our own
-# libraries (exposed C++ code to Python, i.e. darts.engines && darts.physics)
 from darts.engines import value_vector, sim_params
-#from darts.models.physics.dead_oil import DeadOil
-from darts.physics.geothermal.physics import Geothermal
-from darts.models.darts_model import DartsModel
-from darts.physics.properties.iapws.iapws_property_vec import _Backward1_T_Ph_vec
-from darts.physics.properties.iapws.iapws_property import iapws_total_enthalpy_evalutor
+from darts.physics.geothermal.geothermal import Geothermal
+from darts.models.cicd_model import DartsModel
+from darts.physics.properties.iapws.iapws_property_vec import enthalpy_to_temperature
 from darts.reservoirs.unstruct_reservoir import UnstructReservoir
+from darts.engines import well_control_iface
+
 import os
 import numpy as np
 import meshio
+from darts.input.input_data import InputData
 
 def fmt(x):
     return '{:.3}'.format(x)
@@ -17,63 +16,49 @@ def fmt(x):
 # Here the Model class is defined (child-class from DartsModel) in which most of the data and properties for the
 # simulation are defined, e.g. for the reservoir/physics/sim_parameters/etc.
 class Model(DartsModel):
-    def __init__(self, input_data, n_points=1000):
-        """
-        Class constructor of Model class
-        :param n_points: number of discretization points for the parameter space
-        """
-        # Call base class constructor (see darts/models/darts_model.py for more info as well as the links in main.py
-        # on OOP)
+    def __init__(self, idata : InputData):
+        # base class constructor
         super().__init__()
-        self.input_data = input_data
+        self.idata = idata
 
         # Measure time spend on reading/initialization
         self.timer.node["initialization"].start()
 
-        self.bound_cond = input_data['well_loc_type']
+        self.bound_cond = idata.geom['well_loc_type']
 
         # Some permeability input data for the simulation
-        poro = input_data['poro']  # Matrix porosity [-]
-        frac_aper = input_data['frac_aper']  # Aperture of fracture cells (but also takes a list of apertures for each segment) [m]
+        poro = idata.rock.porosity  # Matrix porosity [-]
+        frac_aper = idata.geom['frac_aper']  # Aperture of fracture cells (but also takes a list of apertures for each segment) [m]
 
-        self.inj_well_coords = input_data['inj_well_coords']
-        self.prod_well_coords = input_data['prod_well_coords']
+        self.inj_well_coords = idata.geom['inj_well_coords']
+        self.prod_well_coords = idata.geom['prod_well_coords']
 
-        self.rate_prod = input_data['rate_prod']
-        self.rate_inj = input_data['rate_inj']
-        self.delta_temp = input_data['delta_temp']  # inj_temp = initial_temp - delta_temp
-        self.delta_p_inj  = input_data['delta_p_inj']   # inj_bhp  = initial_pressure + delta_p_inj
-        self.delta_p_prod = input_data['delta_p_prod']  # prod_bhp = initial_pressure - delta_p_prod
+        fname = '_' + idata.geom['mesh_prefix'] + '_' + str(idata.geom['char_len']) + '.msh'
+        mesh_file = os.path.join('meshes_' + idata.geom['case_name'], idata.geom['case_name'] + fname)
 
-        self.perm_file = input_data['perm_file']
-
-        fname = '_' + input_data['mesh_prefix'] + '_' + str(input_data['char_len']) + '.msh'
-        mesh_file = os.path.join('meshes', input_data['case_name'] + fname)
-
-        # set heterogeneous/uniform permeability
-        if self.perm_file is not None:
-            permx = self.get_perm_unstr_from_struct_grid(self.perm_file, self.input_data)
+        if idata.rock.perm_file is not None: # set heterogeneous permeability from a file
+            permx = self.get_perm_unstr_from_struct_grid(idata.rock.perm_file, self.input_data)
             permy = permx
             permz = permx * 0.1
-        else:
-            permx = input_data['perm']
-            permy = input_data['perm']
-            permz = input_data['perm'] * 0.1
+        else: # set homogeneous permeability
+            permx = idata.rock.permx
+            permy = idata.rock.permy
+            permz = idata.rock.permz
 
         # initialize reservoir
         self.reservoir = UnstructReservoir(timer=self.timer, mesh_file=mesh_file,
                                       permx=permx, permy=permy, permz=permz,
                                       poro=poro,
-                                      rcond=input_data['conduction'],
-                                      hcap=input_data['hcap'],
+                                      rcond=idata.rock.conductivity,
+                                      hcap=idata.rock.heat_capacity,
                                       frac_aper=frac_aper)
 
         # parameters for fracture aperture computation depending on principal stresses
-        if 'Sh_max' in input_data:
-            self.reservoir.sh_max = input_data['Sh_max']
-            self.reservoir.sh_min = input_data['Sh_min']
-            self.reservoir.sh_max_azimuth = input_data['SHmax_azimuth']
-            self.reservoir.sigma_c = input_data['sigma_c']
+        if 'Sh_max' in idata.stress:
+            self.reservoir.sh_max = idata.stress['Sh_max']
+            self.reservoir.sh_min = idata.stress['Sh_min']
+            self.reservoir.sh_max_azimuth = idata.stress['SHmax_azimuth']
+            self.reservoir.sigma_c = idata.stress['sigma_c']
 
         # read mesh to get the number of fractures for tags specification
         # assume mesh is extruded and fractures have a quad shape
@@ -81,7 +66,7 @@ class Model(DartsModel):
         msh = meshio.read(mesh_file)
         c = msh.cell_data_dict['gmsh:physical']
         n_fractures = (np.unique(c['quad']) >= 90000).sum()
-        n_fractures = n_fractures * (1 + int(input_data['overburden_layers']>0) + int(input_data['underburden_layers']>0))
+        n_fractures = n_fractures * (1 + int(idata.geom['overburden_layers']>0) + int(idata.geom['underburden_layers']>0))
 
         # 9991 - rsv, 9992 - overburden, 9993 - underburden, 9994 - overburden2, 9995 - underburden2
         self.reservoir.physical_tags['matrix'] = [9991 + i for i in range(5)]
@@ -105,120 +90,162 @@ class Model(DartsModel):
         '''
 
         # discretize
-        self.reservoir.init_reservoir(verbose=False)
-
-        # set boundary volume XY
-        if False:
-            boundary_cells = []
-            for bnd_tag in [1, 2, 3, 4, 5, 6]:
-                boundary_cells += self.reservoir.discretizer.find_cells(bnd_tag, 'face')
+        print('Discretize...')
+        self.reservoir.init_reservoir(verbose=True)
+        print('Done')
+        
+        if False: # set boundary volume XY
+            print('Set boundary volume...')
+            # set boundary volume XY
+            bnd_xy_tags = [3, 4, 5, 6]
+            boundary_cells = self.reservoir.discretizer.find_cells(bnd_xy_tags, 'face')
             boundary_cells = np.array(boundary_cells) + self.reservoir.discretizer.frac_cells_tot
-            #bnd_vol = 1e+8
-            bnd_vol_mult = 5
+            bnd_vol = 1e+15  # [m3] - large volume for boundary cells to mimic infinite reservoir
             # for vtk output
-            self.reservoir.discretizer.volume_all_cells[boundary_cells] *= bnd_vol_mult  # = bnd_vol
+            self.reservoir.discretizer.volume_all_cells[boundary_cells] = bnd_vol
             # for engines
-            np.array(self.reservoir.mesh.volume, copy=False)[boundary_cells] *= bnd_vol_mult # = bnd_vol
+            np.array(self.reservoir.mesh.volume, copy=False)[boundary_cells] = bnd_vol
+            print('Done')
 
         # initialize physics
         self.cell_property = ['pressure', 'enthalpy', 'temperature']
 
-        from darts.physics.geothermal.property_container import PropertyContainer
-        property_container = PropertyContainer()
-        property_container.output_props = {'T,degrees': lambda: property_container.temperature - 273.15}
-
-        # Create rock_compaction object to set rock compressibility (it is 0 by default)
-        from darts.physics.properties.iapws.custom_rock_property import custom_rock_compaction_evaluator
-        property_container.rock = [value_vector([1, input_data['rock_compressibility'], 273.15])]
-        property_container.rock_compaction_ev = custom_rock_compaction_evaluator(property_container.rock)
-
-        self.physics = Geothermal(timer=self.timer, n_points=n_points, min_p=100, max_p=500,
-                                  min_e=1000, max_e=25000, cache=False)
-        self.physics.add_property_region(property_container)
+        self.physics = Geothermal(self.idata, self.timer)
 
         # End timer for model initialization:
         self.timer.node["initialization"].stop()
 
-    def set_nonuniform_initial_conditions(self, mesh):
-        """""
-        Function to set non-uniform initial reservoir condition by p and T gradients
-        Arguments:
-            -mesh: mesh object
-        uses global object input_data: dictionary with parameters
-        """
-
-        depth = np.array(mesh.depth, copy=True)
-        print('depth:', depth.min(), '-', depth.max(), 'm.')
-        # set initial pressure
-        pressure = np.array(mesh.pressure, copy=False)
-        pressure[:] = (depth - self.input_data['reference_depth_for_pressure']) * self.input_data['pressure_gradient'] + \
-                      self.input_data['pressure_initial']
-
-        enthalpy = np.array(mesh.enthalpy, copy=False)
-        init_temperature = (depth - self.input_data['reference_depth_for_temperature']) * self.input_data['temperature_gradient'] + \
-                      + self.input_data['temperature_initial'] + \
-                      273.15 # convert to K
-
-        self.pressure_initial_mean = pressure.mean()
-        self.temperature_initial_mean = init_temperature.mean()
-
-        for j in range(mesh.n_blocks):
-            state = value_vector([pressure[j], 0])
-            E = iapws_total_enthalpy_evalutor(init_temperature[j])
-            enthalpy[j] = E.evaluate(state)
+    def print_range(self, time, part='cells'):
+        depth = np.array(self.reservoir.mesh.depth, copy=True)
+        start, end = self.get_mat_frac_range(part)
+        D = depth[start:end]
+        P = self.get_pressure(part)
+        T = self.get_temperature(part)
+        suf = '(MAT)'  # matrix cells
+        if part == 'full':
+            suf = '(MAT+FRAC)'  # matrix+fracture cells
+        elif part == 'fracs':
+            suf = '(FRAC)'  # matrix+fracture cells
+        print('Time', fmt(time/365.25), ' years; ', time, 'days, '
+              'D_range:', fmt(D.min()), '-', fmt(D.max()), 'm; ',
+              'P_range:', fmt(P.min()), '-', fmt(P.max()), 'bars; ',
+              'T_range:', fmt(T.min()), '-', fmt(T.max()), 'K', suf)
 
     def set_initial_conditions(self):
-        """
-        :return:
-        """
-        if self.input_data['initial_uniform'] == True:
-            self.physics.set_uniform_initial_conditions(self.reservoir.mesh, uniform_pressure=self.input_data['uniform_pressure'],
-                                                        uniform_temperature=self.input_data['uniform_temperature'])
-            self.pressure_initial_mean = self.input_data['uniform_pressure']
-            self.temperature_initial_mean = self.input_data['uniform_temperature']
-        else:
-            # Takes care of uniform initialization of pressure and temperature in this example:
-            #self.physics.set_uniform_initial_conditions(self.reservoir.mesh, uniform_pressure=350,uniform_temperature=348.15)
-            self.set_nonuniform_initial_conditions(self.reservoir.mesh)
+        if self.idata.initial.type == 'gradient':
+            # Specify reference depth, values and gradients to construct depth table in super().set_initial_conditions()
+            input_depth = [0., np.amax(self.reservoir.mesh.depth)]
+            input_distribution = {'pressure': [1., 1. + input_depth[1] * self.idata.initial.pressure_gradient / 1000],
+                                  'temperature': [293.15, 293.15 + input_depth[
+                                      1] * self.idata.initial.temperature_gradient / 1000]
+                                  }
+            return self.physics.set_initial_conditions_from_depth_table(self.reservoir.mesh,
+                                                                        input_distribution=input_distribution,
+                                                                        input_depth=input_depth)
+        elif self.idata.initial.type == 'uniform':
+            input_distribution = {'pressure': self.idata.initial.initial_pressure,
+                                  'temperature': self.idata.initial.initial_temperature}
+            return self.physics.set_initial_conditions_from_array(self.reservoir.mesh,
+                                                                  input_distribution=input_distribution)
 
-        return 0
+    def well_is_inj(self, wname : str):  # determine well control by its name
+        return "I" in wname
 
     def set_well_controls(self):
-        """
-        Class method called in the init() class method of parents class
-        :return:
-        """
-        # Takes care of well controls, argument of the function is (in case of bhp) the bhp pressure and (in case of
-        # rate) water/oil rate:
+        wctrl = self.idata.well_data.controls
+        inj_rate = wctrl.inj_rate
+        prod_rate = wctrl.prod_rate
+
+        P = self.get_pressure('full')
+        T = self.get_temperature('full')
+        if P.size:
+            self.pressure_initial_mean = P.mean()
+            self.temperature_initial_mean = T.mean()
+        else:
+            self.pressure_initial_mean = self.idata.initial.initial_pressure
+            self.temperature_initial_mean = self.idata.initial.initial_temperature
+
+        if True:
+            inj_bhp = self.pressure_initial_mean + wctrl.delta_p_inj
+            inj_temp = self.temperature_initial_mean - wctrl.delta_temp
+            prod_bhp = self.pressure_initial_mean - wctrl.delta_p_prod
+        else:  # if engine is not initialized yet, set well control rate=0
+            inj_temp = 0
+            inj_rate = 0
+            prod_rate = 0
+
         for i, w in enumerate(self.reservoir.wells):
-            if 'I' in w.name:
-                # Add controls for injection well:
-                # Specify both pressure and temperature (since it's upstream for injection well)
-                if self.rate_inj is None:
-                    w.control = self.physics.new_bhp_water_inj(self.pressure_initial_mean + self.delta_p_inj, self.temperature_initial_mean - self.delta_temp)
+            if self.well_is_inj(w.name):
+                if inj_rate is None:
+                    # w.control = self.physics.new_bhp_water_inj(inj_bhp, inj_temp)
+                    self.physics.set_well_controls(wctrl=w.control,
+                                                   control_type = well_control_iface.BHP,
+                                                   is_inj = True,
+                                                   target = inj_bhp,
+                                                   inj_temp = inj_temp)
                 else:
-                    w.control = self.physics.new_rate_water_inj(self.rate_inj, self.temperature_initial_mean - self.delta_temp)
-                    w.constraint = self.physics.new_bhp_water_inj(450, self.temperature_initial_mean - self.delta_temp)
+                    # w.control = self.physics.new_rate_water_inj(inj_rate, inj_temp)
+                    self.physics.set_well_controls(wctrl=w.control,
+                                                   control_type = well_control_iface.VOLUMETRIC_RATE,
+                                                   is_inj = True,
+                                                   target = inj_rate,
+                                                   phase_name = 'water',
+                                                   inj_temp = inj_temp)
+                    # w.constraint = self.physics.new_bhp_water_inj(wctrl.inj_bhp_constraint, inj_temp)
+                    self.physics.set_well_controls(wctrl=w.constraint,
+                                                   control_type = well_control_iface.BHP,
+                                                   is_inj = True,
+                                                   target = wctrl.inj_bhp_constraint,
+                                                   inj_temp = inj_temp)
             else:
-                # Add controls for production well:
-                # Specify bhp for particular production well:
-                if self.rate_prod is None:
-                    w.control = self.physics.new_bhp_prod(self.pressure_initial_mean - self.delta_p_prod)
+                if prod_rate is None:
+                    # w.control = self.physics.new_bhp_prod(prod_bhp)
+                    self.physics.set_well_controls(wctrl=w.control,
+                                                   control_type=well_control_iface.BHP,
+                                                   is_inj=False,
+                                                   target=prod_bhp)
                 else:
-                    w.control = self.physics.new_rate_water_prod(self.rate_prod)
-                    w.constraint = self.physics.new_bhp_prod(50)
-            print(w.name,
-                  w.well_head_depth,
-                  w.control.target_pressure if hasattr(w.control, 'target_pressure') else '',
-                  w.control.target_temperature if hasattr(w.control, 'target_temperature') else '',
-                  w.control.target_rate if hasattr(w.control, 'target_rate') else '')
+                    # w.control = self.physics.new_rate_water_prod(prod_rate)
+                    self.physics.set_well_controls(wctrl=w.control,
+                                                   control_type=well_control_iface.VOLUMETRIC_RATE,
+                                                   is_inj=False,
+                                                   target = prod_rate)
+                    # w.constraint = self.physics.new_bhp_prod(wctrl.prod_bhp_constraint)
+                    self.physics.set_well_controls(wctrl=w.constraint,
+                                                   control_type=well_control_iface.BHP,
+                                                   is_inj = False,
+                                                   target = wctrl.prod_bhp_constraint)
+
+            # print(w.name,
+            #       w.well_head_depth,
+            #       w.control.target_pressure if hasattr(w.control, 'target_pressure') else '',
+            #       w.control.target_temperature if hasattr(w.control, 'target_temperature') else '',
+            #       w.control.target_rate if hasattr(w.control, 'target_rate') else '')
         return 0
 
+    def get_mat_frac_range(self, part):
+        start = 0
+        if part == 'full':
+            end = self.reservoir.discretizer.frac_cells_tot + self.reservoir.discretizer.mat_cells_tot
+        elif part == 'cells':
+            end = self.reservoir.discretizer.mat_cells_tot
+            start = self.reservoir.discretizer.frac_cells_tot
+        elif part == 'fracs':
+            end = self.reservoir.discretizer.frac_cells_tot
+        return [start, end]
 
-    def enthalpy_to_temperature(self, data): # data is X = (p, T)
-        data_len = int(len(data) / self.physics.n_vars) # 2: p,E
-        T = np.zeros(data_len)
-        T[:] = _Backward1_T_Ph_vec(data[::self.physics.n_vars] / 10, data[1::self.physics.n_vars] / 18.015)
+    def get_pressure(self, part='cells'):
+        nvars = 2
+        start, end = self.get_mat_frac_range(part)
+        Xn = np.array(self.physics.engine.X, copy=True)
+        P = Xn[nvars*start:nvars*end:nvars]
+        return P
+
+    def get_temperature(self, part='cells'):
+        nvars = 2
+        start, end = self.get_mat_frac_range(part)
+        Xn = np.array(self.physics.engine.X, copy=True)
+        T = enthalpy_to_temperature(Xn[nvars*start:nvars*end])
         return T
 
     def calc_well_loc(self):
@@ -300,7 +327,7 @@ class Model(DartsModel):
             [xx, yy, perm_rect_2d] = np.load(perm_file, allow_pickle=True)
             perm_rect_1d = perm_rect_2d.flatten()  # TODO: check XY-order
             cntr = self.discretizer.centroid_all_cells[self.discretizer.fracture_cell_count:]
-            z_middle = input_data['z_top'] + input_data['height'] * 0.5  # middle depth of the reservoir
+            z_middle = input_data['z_top'] + input_data['height_res'] * 0.5  # middle depth of the reservoir
             rect_grid = np.vstack((xx.flatten(), yy.flatten(), np.zeros(xx.flatten().shape) + z_middle)).transpose()
             perm_unstr = np.zeros(cntr.size)
             c_idx = 0
